@@ -1,0 +1,214 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WebRTC Video Call</title>
+  <!-- Ensure these scripts are loaded correctly and check their URLs -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.5.0/sockjs.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+</head>
+<body>
+
+
+<video id="localVideo" autoplay muted style="width: 300px; height: 200px;"></video>
+
+<p>me</p>
+<video id="remoteVideo" autoplay muted style="width: 300px; height: 200px;"></video>
+<p>other users</p>
+<button onclick="startCall()">Start Call</button>
+<button onclick="endCall()">End Call</button>
+
+<script>
+
+  var remoteStream; // Define remoteStream globally
+
+  var stompClient = null;
+  var localVideo = document.getElementById('localVideo');
+  var remoteVideo = document.getElementById('remoteVideo');
+  var userCountSpan = document.getElementById('userCount');
+  var localStream;
+  var peerConnection;
+
+  var iceCandidateQueue = [];
+  var callStarted = false;
+
+  function connect() {
+    // Connect to the WebSocket server
+    var socket = new SockJS('/websocket');
+    stompClient = Stomp.over(socket);
+    stompClient.connect({}, function(frame) {
+      console.log('Connected: ' + frame);
+      // Subscribe to the signal topic to receive signals
+      stompClient.subscribe('/topic/signal', function(message) {
+        handleSignal(JSON.parse(message.body));
+      });
+      // Subscribe to the userCount topic to receive user count updates
+      stompClient.subscribe('/topic/userCount', function(message) {
+        updateUserCount(JSON.parse(message.body).count);
+      });
+    });
+  }
+
+  function startCall() {
+    if (!callStarted) {
+      connect();
+      // Get local media stream
+      navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+              .then(function(stream) {
+                localStream = stream;
+                // Display local video stream on the page
+                localVideo.srcObject = localStream;
+                // Set up PeerConnection
+                setupPeerConnection();
+              }).catch(function(error) {
+        console.error('Error accessing media devices:', error);
+      });
+      callStarted = true;
+    }
+  }
+
+  function updateUserCount(count) {
+    // Update the displayed user count
+    userCountSpan.textContent = count;
+  }
+
+  function setupPeerConnection() {
+    var configuration = { "iceServers": [
+        { "urls": "stun:stun.silkroad.cloud.aliyuncs.com:3478" }] };
+    peerConnection = new RTCPeerConnection(configuration);
+    // Add local video stream to PeerConnection
+    localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+    // Listen for remote media stream and display it on the page
+    peerConnection.ontrack = function(event) {
+      if (!remoteStream) {
+        remoteStream = new MediaStream();
+        remoteVideo.srcObject = remoteStream;
+      }
+      remoteStream.addTrack(event.track);
+    };
+
+    // Listen for ICE candidates and send them to the remote peer
+    peerConnection.onicecandidate = function(event) {
+      if (event.candidate) {
+        console.log('ICE candidate:', event.candidate);
+        sendSignal({ "candidate": event.candidate });
+      }
+    };
+
+    // // Create offer
+    // peerConnection.onnegotiationneeded = function() {
+    //     peerConnection.createOffer().then(offer => {
+    //         return peerConnection.setLocalDescription(offer);
+    //     }).then(() => {
+    //         console.log('Local description set:', peerConnection.localDescription);
+    //         sendSignal({ "desc": peerConnection.localDescription });
+    //     }).catch(handleError);
+    // };
+    // Create offer
+    peerConnection.onnegotiationneeded = function() {
+      if (peerConnection.signalingState !== 'stable') {
+        console.warn('Signaling state is not stable. Ignoring onnegotiationneeded event.');
+        return;
+      }
+      peerConnection.createOffer().then(offer => {
+        return peerConnection.setLocalDescription(offer);
+      }).then(() => {
+        console.log('Local description set:', peerConnection.localDescription);
+        sendSignal({ "desc": peerConnection.localDescription });
+      }).catch(handleError);
+    };
+
+  }
+
+  function handleSignal(message) {
+    if (message.desc) {
+      const desc = new RTCSessionDescription(message.desc);
+      if (desc.type === 'offer') {
+        if (!peerConnection.currentRemoteDescription) {
+          console.log('Setting remote description');
+          peerConnection.setRemoteDescription(desc).then(() => {
+            console.log('Remote description set successfully');
+            return peerConnection.createAnswer();
+          }).then(answer => {
+            console.log('Creating answer');
+            return peerConnection.setLocalDescription(answer);
+          }).then(() => {
+            console.log('Sending answer');
+            sendSignal({ "desc": peerConnection.localDescription });
+          }).catch(handleError);
+        } else {
+          console.log('Remote description is already set');
+        }
+      } else if (desc.type === 'answer') {
+        if (peerConnection.signalingState === 'have-local-offer' || peerConnection.signalingState === 'have-remote-offer') {
+          console.log('Setting remote answer');
+          peerConnection.setRemoteDescription(desc).then(() => {
+            console.log('Remote description set successfully');
+            // 添加对ontrack事件的监听
+            peerConnection.ontrack = function(event) {
+              if (!remoteStream) {
+                remoteStream = new MediaStream();
+                remoteVideo.srcObject = remoteStream;
+              }
+              remoteStream.addTrack(event.track);
+            };
+
+            // Listen for connection state change
+            peerConnection.onconnectionstatechange = function(event) {
+              console.log('Connection state changed:', peerConnection.connectionState);
+              if (peerConnection.connectionState === 'connected') {
+                console.log('Peer connection established successfully!');
+              }
+            };
+          }).catch(handleError);
+        } else {
+          console.log('Ignoring remote answer due to wrong state:', peerConnection.signalingState);
+        }
+      }
+    } else if (message.candidate) {
+      // Add ICE candidate
+      // Make sure the remote description is set before adding ICE candidates
+      if (peerConnection.remoteDescription) {
+        peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate)).catch(handleError);
+      } else {
+        // Push ICE candidates to the queue
+        iceCandidateQueue.push(message.candidate);
+      }
+    }
+  }
+
+
+  // Send signal
+  function sendSignal(message) {
+    stompClient.send("/app/signal", {}, JSON.stringify(message));
+  }
+
+  // End the call
+  function endCall() {
+    if (peerConnection) {
+      peerConnection.close();
+    }
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+    }
+    if (stompClient !== null) {
+      stompClient.disconnect();
+    }
+    console.log('Call ended');
+  }
+
+  // Error handling
+  function handleError(error) {
+    console.error('Error: ', error);
+  }
+
+  // Automatically end the call when the page is closed
+  window.addEventListener('beforeunload', function() {
+    endCall();
+  });
+
+</script>
+</body>
+</html>
